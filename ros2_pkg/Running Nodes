@@ -1,0 +1,5 @@
+# Run publisher
+ros2 run ros2_pkg number_publisher
+
+# Run subscriber
+ros2 run ros2_pkg number_subscriber

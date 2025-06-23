@@ -1,0 +1,10 @@
+# Source ROS 2 environment
+source /opt/ros/humble/setup.bash
+
+# Source your workspace
+source ~/ros2_ws/install/setup.bash
+
+# Auto-source on terminal startup
+echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
+echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
+source ~/.bashrc

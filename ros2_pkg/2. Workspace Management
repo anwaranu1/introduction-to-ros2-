@@ -1,0 +1,9 @@
+# Create workspace
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws
+
+# Build workspace
+colcon build
+
+# Build specific package
+colcon build --packages-select ros2_pkg
