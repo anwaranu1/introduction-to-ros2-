@@ -1,0 +1,11 @@
+Talker Node (Publisher):
+  ros2 run demo_nodes_py talker
+
+Listener Node (Subscriber):
+   ros2 run demo_nodes_py listener
+   
+1. Launch Turtlesim Simulator
+   ros2 run turtlesim turtlesim_node
+
+2. Control the Turtle with Keyboard
+  ros2 run turtlesim turtle_teleop_key
