@@ -1,1 +1,9 @@
+# Go to your package's Python folder
+cd ~/ros2_ws/src/ros2_pkg/ros2_pkg
+
+# Create a new node file (for example, a publisher node)
+touch publisher.py
+
+# Open the file in VS Code (or any editor)
+code publisher.py
 
