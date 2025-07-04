@@ -1,0 +1,4 @@
+sudo snap install --classic code
+
+for launch
+  code
