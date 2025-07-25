@@ -1,0 +1,215 @@
+Light ON/OFF toggle via call (auto hangup).
+
+Motor ON/OFF control via SMS commands (MOTOR ON / MOTOR OFF).
+
+Status check via SMS (STATE or STATUS).
+
+Robust parsing and debounce to improve long-term stability.
+
+Software reset triggered remotely by SMS (RESTART or RESET) using the watchdog timer.
+
+#include <SoftwareSerial.h>
+#include <avr/wdt.h>  // Needed for watchdog reset
+
+SoftwareSerial gsmSerial(2, 3); // RX, TX for GSM module
+
+const int relayPin = 7;
+const int motorPin = 8;          // Motor control pin
+
+const bool RELAY_ACTIVE_HIGH = false;  // Set true if relay is active HIGH, else false
+const bool MOTOR_ACTIVE_HIGH = true;   // Set according to your motor driver
+
+bool lightState = false;
+bool motorState = false;
+
+String lineBuffer = "";      // Buffer for GSM serial input line
+unsigned long lastToggleMillis = 0;
+const unsigned long debounceDelay = 5000; // 5 seconds debounce to avoid multiple toggles
+
+String caller = "";
+
+void setup() {
+  pinMode(relayPin, OUTPUT);
+  pinMode(motorPin, OUTPUT);
+
+  setRelay(false);  // Turn off light at startup
+  setMotor(false);  // Turn off motor at startup
+
+  Serial.begin(9600);
+  gsmSerial.begin(9600);
+  delay(2000);
+
+  gsmInit();
+}
+
+void loop() {
+  while (gsmSerial.available()) {
+    char c = gsmSerial.read();
+
+    if (c == '\n' || c == '\r') {
+      if (lineBuffer.length() > 0) {
+        processLine(lineBuffer);
+        lineBuffer = "";
+      }
+    } else {
+      lineBuffer += c;
+      // Prevent buffer overflow
+      if (lineBuffer.length() > 120) lineBuffer = "";
+    }
+  }
+}
+
+// Initialize GSM module with retries and confirmation
+void gsmInit() {
+  for (int i = 0; i < 5; i++) {
+    sendCommand("AT");
+    if (waitForResponse("OK", 2000)) break;
+    delay(1000);
+  }
+  sendCommand("ATE0");           // Disable echo
+  delay(500);
+  sendCommand("AT+CLIP=1");      // Enable caller ID notification
+  delay(500);
+  sendCommand("AT+CMGF=1");      // Set SMS mode to text
+  delay(500);
+  sendCommand("AT+CNMI=1,2,0,0,0"); // SMS direct delivery mode
+  delay(500);
+}
+
+void processLine(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+
+  // Incoming call with caller ID
+  if (line.startsWith("+CLIP:")) {
+    caller = parseNumber(line);
+
+    // Debounce call toggles to avoid multiple toggles per call
+    if (millis() - lastToggleMillis > debounceDelay) {
+      lastToggleMillis = millis();
+
+      sendCommand("ATH");           // Auto hang up call
+      waitForResponse("OK", 2000);
+
+      lightState = !lightState;     // Toggle light state
+      setRelay(lightState);
+
+      sendSMS(caller, "Light turned " + String(lightState ? "ON" : "OFF"));
+    }
+    caller = "";
+  }
+  // Incoming SMS notification
+  else if (line.startsWith("+CMT:")) {
+    String sender = parseNumber(line);
+    delay(100); // Give time for message body arrival
+
+    String message = "";
+    unsigned long startMillis = millis();
+
+    while ((millis() - startMillis) < 5000) { 
+      while (gsmSerial.available()) {
+        char ch = gsmSerial.read();
+        if (ch == '\r' || ch == '\n') {
+          if (message.length() > 0) {
+            message.trim();
+            handleSMS(sender, message);
+            return;
+          }
+        } else {
+          message += ch;
+        }
+      }
+      delay(50);
+    }
+  }
+}
+
+void handleSMS(String sender, String message) {
+  message.toUpperCase();
+
+  if (message == "STATE" || message == "STATUS") {
+    sendSMS(sender, "Light is " + String(lightState ? "ON" : "OFF") +
+                    "\nMotor is " + String(motorState ? "ON" : "OFF"));
+  }
+  else if (message == "MOTOR ON") {
+    motorState = true;
+    setMotor(true);
+    sendSMS(sender, "Motor turned ON");
+  }
+  else if (message == "MOTOR OFF") {
+    motorState = false;
+    setMotor(false);
+    sendSMS(sender, "Motor turned OFF");
+  }
+  else if (message == "RESTART" || message == "RESET") {
+    sendSMS(sender, "Restarting Arduino...");
+    delay(500);
+    wdt_enable(WDTO_15MS);  // Trigger watchdog reset after ~15 ms
+    while (true) {
+      // Wait for reset
+    }
+  }
+  else {
+    sendSMS(sender, "Unknown command");
+  }
+}
+
+void setRelay(bool on) {
+  if (RELAY_ACTIVE_HIGH) {
+    digitalWrite(relayPin, on ? HIGH : LOW);
+  } else {
+    digitalWrite(relayPin, on ? LOW : HIGH); // Active LOW relay typical
+  }
+}
+
+void setMotor(bool on) {
+  if (MOTOR_ACTIVE_HIGH) {
+    digitalWrite(motorPin, on ? HIGH : LOW);
+  } else {
+    digitalWrite(motorPin, on ? LOW : HIGH);
+  }
+}
+
+void sendCommand(String cmd) {
+  gsmSerial.println(cmd);
+}
+
+bool waitForResponse(String expected, unsigned long timeout) {
+  unsigned long start = millis();
+  String resp = "";
+  while (millis() - start < timeout) {
+    while (gsmSerial.available()) {
+      char c = gsmSerial.read();
+      resp += c;
+      if (resp.indexOf(expected) != -1) {
+        return true;
+      }
+    }
+    delay(10);
+  }
+  return false;
+}
+
+void sendSMS(String number, String msg) {
+  sendCommand("AT+CMGF=1");
+  if (!waitForResponse("OK", 1000)) return;
+
+  gsmSerial.print("AT+CMGS=\"");
+  gsmSerial.print(number);
+  gsmSerial.println("\"");
+  delay(500);
+  gsmSerial.print(msg);
+  delay(500);
+  gsmSerial.write(26); // Ctrl+Z to send SMS
+  waitForResponse("OK", 5000);
+}
+
+// Parse phone number from +CLIP or +CMT message header line
+String parseNumber(String clipLine) {
+  int start = clipLine.indexOf("\"") + 1;
+  int end = clipLine.indexOf("\"", start);
+  if (start > 0 && end > start) {
+    return clipLine.substring(start, end);
+  }
+  return "";
+}
