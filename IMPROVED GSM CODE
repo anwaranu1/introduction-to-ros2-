@@ -1,0 +1,341 @@
+#include <SoftwareSerial.h>
+#include <avr/wdt.h>  // Needed for watchdog reset
+
+SoftwareSerial gsmSerial(2, 3); // RX, TX for GSM module
+
+const int relayPin = 7;
+const int motorPin = 8;          // Motor control pin
+
+const bool RELAY_ACTIVE_HIGH = false;  // Set true if relay is active HIGH, else false
+const bool MOTOR_ACTIVE_HIGH = true;   // Set according to your motor driver
+
+bool lightState = false;
+bool motorState = false;
+
+String lineBuffer = "";      // Buffer for GSM serial input line
+unsigned long lastToggleMillis = 0;
+const unsigned long debounceDelay = 5000; // 5 seconds debounce to avoid multiple toggles
+
+String caller = "";
+
+// Admin and trusted numbers setup
+String adminNumber = "";
+const int MAX_TRUSTED = 10;
+String trustedNumbers[MAX_TRUSTED];
+int trustedCount = 0;
+
+void setup() {
+  pinMode(relayPin, OUTPUT);
+  pinMode(motorPin, OUTPUT);
+
+  setRelay(false);  // Turn off light at startup
+  setMotor(false);  // Turn off motor at startup
+
+  Serial.begin(9600);
+  gsmSerial.begin(9600);
+  delay(2000);
+
+  wdt_enable(WDTO_8S);  // Enable watchdog timer set to 8 seconds
+
+  gsmInit();
+  sendSMSToAdminIfSet("System started. Waiting for admin call.");
+}
+
+void loop() {
+  wdt_reset();  // Reset watchdog timer
+
+  while (gsmSerial.available()) {
+    char c = gsmSerial.read();
+
+    if (c == '\n' || c == '\r') {
+      if (lineBuffer.length() > 0) {
+        processLine(lineBuffer);
+        lineBuffer = "";
+      }
+    } else {
+      lineBuffer += c;
+      // Prevent buffer overflow
+      if (lineBuffer.length() > 120) lineBuffer = "";
+    }
+  }
+}
+
+void gsmInit() {
+  for (int i = 0; i < 5; i++) {
+    sendCommand("AT");
+    if (waitForResponse("OK", 2000)) break;
+    delay(1000);
+  }
+  sendCommand("ATE0");           // Disable echo
+  delay(500);
+  sendCommand("AT+CLIP=1");      // Enable caller ID notification
+  delay(500);
+  sendCommand("AT+CMGF=1");      // Set SMS mode to text
+  delay(500);
+  sendCommand("AT+CNMI=1,2,0,0,0"); // SMS direct delivery mode
+  delay(500);
+}
+
+void processLine(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+
+  if (line.startsWith("+CLIP:")) {
+    caller = parseNumber(line);
+
+    // Hang up call immediately to avoid ring delays
+    sendCommand("ATH");
+    waitForResponse("OK", 1000);
+
+    // If no admin is set, first caller becomes admin
+    if (adminNumber == "") {
+      adminNumber = caller;
+      sendSMS(adminNumber, "You are now the admin.");
+      Serial.println("Admin set to: " + adminNumber);
+    }
+
+    // If authorized caller, toggle light on call (debounce applied)
+    if (isAuthorizedCaller(caller)) {
+      if (millis() - lastToggleMillis > debounceDelay) {
+        lastToggleMillis = millis();
+        lightState = !lightState;
+        setRelay(lightState);
+        sendSMS(caller, String("Light turned ") + (lightState ? "ON" : "OFF") + " via call");
+      }
+    }
+    caller = "";
+  }
+  else if (line.startsWith("+CMT:")) {
+    String sender = parseNumber(line);
+    delay(100); // Allow message to arrive
+
+    String message = "";
+    unsigned long startMillis = millis();
+
+    while ((millis() - startMillis) < 5000) {
+      while (gsmSerial.available()) {
+        char ch = gsmSerial.read();
+        if (ch == '\r' || ch == '\n') {
+          if (message.length() > 0) {
+            message.trim();
+            handleSMS(sender, message);
+            return;
+          }
+        } else {
+          message += ch;
+        }
+      }
+      delay(10); // Reduced delay for responsiveness
+    }
+  }
+}
+
+bool isAuthorizedCaller(String number) {
+  if (number == adminNumber) return true;
+  for (int i = 0; i < trustedCount; i++) {
+    if (trustedNumbers[i] == number) return true;
+  }
+  return false;
+}
+
+bool isAdmin(String number) {
+  return (number == adminNumber);
+}
+
+void handleSMS(String sender, String message) {
+  message.toUpperCase();
+
+  // Admin commands
+  if (isAdmin(sender)) {
+    if (message.startsWith("ADD+")) {
+      String numToAdd = message.substring(4);
+      numToAdd.trim();
+      if (addTrustedNumber(numToAdd)) {
+        sendSMS(sender, "Number added: " + numToAdd);
+      } else {
+        sendSMS(sender, "Failed to add number. List may be full or invalid.");
+      }
+    }
+    else if (message.startsWith("DEL+")) {
+      String numToDel = message.substring(4);
+      numToDel.trim();
+      if (removeTrustedNumber(numToDel)) {
+        sendSMS(sender, "Number removed: " + numToDel);
+      } else {
+        sendSMS(sender, "Number not found in trusted list.");
+      }
+    }
+    else if (message == "LIST") {
+      String listMsg = "Trusted Numbers:";
+      if (trustedCount == 0) {
+        listMsg += " None";
+      } else {
+        for (int i = 0; i < trustedCount; i++) {
+          listMsg += "\n" + trustedNumbers[i];
+        }
+      }
+      sendSMS(sender, listMsg);
+    }
+    else if (message == "CLEAR") {
+      trustedCount = 0;
+      sendSMS(sender, "All trusted numbers cleared.");
+    }
+    else if (message == "STATE" || message == "STATUS") {
+      sendSMS(sender, String("Light is ") + (lightState ? "ON" : "OFF") +
+                      "\nMotor is " + (motorState ? "ON" : "OFF"));
+    }
+    else if (message == "MOTOR ON") {
+      motorState = true;
+      setMotor(true);
+      sendSMS(sender, "Motor turned ON");
+    }
+    else if (message == "MOTOR OFF") {
+      motorState = false;
+      setMotor(false);
+      sendSMS(sender, "Motor turned OFF");
+    }
+    else if (message == "RESTART" || message == "RESET") {
+      sendSMS(sender, "Restarting Arduino...");
+      delay(500);
+      wdt_enable(WDTO_15MS);
+      while (true) {}
+    }
+    else if (message == "TOGGLE") {
+      lightState = !lightState;
+      setRelay(lightState);
+      sendSMS(sender, String("Light toggled to ") + (lightState ? "ON" : "OFF"));
+    }
+    else {
+      sendSMS(sender, "Unknown command");
+    }
+  }
+  // Trusted users (non-admin)
+  else if (isAuthorizedCaller(sender)) {
+    if (message == "TOGGLE") {
+      lightState = !lightState;
+      setRelay(lightState);
+      sendSMS(sender, String("Light toggled to ") + (lightState ? "ON" : "OFF"));
+    }
+    else if (message == "STATE" || message == "STATUS") {
+      sendSMS(sender, String("Light is ") + (lightState ? "ON" : "OFF") +
+                      "\nMotor is " + (motorState ? "ON" : "OFF"));
+    }
+    else if (message == "MOTOR ON" || message == "MOTOR OFF") {
+      sendSMS(sender, "Unauthorized: Only admin can control motor");
+    }
+    else {
+      sendSMS(sender, "Unknown or unauthorized command");
+    }
+  }
+  else {
+    sendSMS(sender, "Unauthorized user");
+  }
+}
+
+bool addTrustedNumber(String num) {
+  if (num.length() < 8) return false;
+
+  for (int i = 0; i < trustedCount; i++) {
+    if (trustedNumbers[i] == num) return false; // already added
+  }
+  if (trustedCount < MAX_TRUSTED) {
+    trustedNumbers[trustedCount++] = num;
+    return true;
+  }
+  return false;
+}
+
+bool removeTrustedNumber(String num) {
+  for (int i = 0; i < trustedCount; i++) {
+    if (trustedNumbers[i] == num) {
+      for (int j = i; j < trustedCount - 1; j++) {
+        trustedNumbers[j] = trustedNumbers[j + 1];
+      }
+      trustedCount--;
+      return true;
+    }
+  }
+  return false;
+}
+
+void setRelay(bool on) {
+  if (RELAY_ACTIVE_HIGH) {
+    digitalWrite(relayPin, on ? HIGH : LOW);
+  } else {
+    digitalWrite(relayPin, on ? LOW : HIGH); // Active LOW relay typical
+  }
+}
+
+void setMotor(bool on) {
+  if (MOTOR_ACTIVE_HIGH) {
+    digitalWrite(motorPin, on ? HIGH : LOW);
+  } else {
+    digitalWrite(motorPin, on ? LOW : HIGH);
+  }
+}
+
+void sendCommand(String cmd) {
+  gsmSerial.println(cmd);
+}
+
+bool waitForResponse(String expected, unsigned long timeout) {
+  unsigned long start = millis();
+  String resp = "";
+  while (millis() - start < timeout) {
+    while (gsmSerial.available()) {
+      char c = gsmSerial.read();
+      resp += c;
+      if (resp.indexOf(expected) != -1) {
+        return true;
+      }
+    }
+    delay(10);
+  }
+  return false;
+}
+
+void sendSMS(String number, String msg) {
+  sendCommand("AT+CMGF=1");
+  if (!waitForResponse("OK", 1000)) return;
+
+  gsmSerial.print("AT+CMGS=\"");
+  gsmSerial.print(number);
+  gsmSerial.println("\"");
+  delay(500);
+  gsmSerial.print(msg);
+  delay(500);
+  gsmSerial.write(26); // Ctrl+Z to send SMS
+  waitForResponse("OK", 5000);
+}
+
+void sendSMSToAdminIfSet(String msg) {
+  if (adminNumber != "") {
+    sendSMS(adminNumber, msg);
+  }
+}
+
+String parseNumber(String clipLine) {
+  int start = clipLine.indexOf("\"") + 1;
+  int end = clipLine.indexOf("\"", start);
+  if (start > 0 && end > start) {
+    return clipLine.substring(start, end);
+  }
+  return "";
+}
+
+USER MANUAL
+Admin Features (Only admin phone number):
+Command	Description	Example
+ADD+<number>	Add a trusted user number	ADD+919812345678
+DEL+<number>	Remove a trusted user number	DEL+919812345678
+LIST	List all trusted numbers	LIST
+CLEAR	Remove all trusted numbers	CLEAR
+TOGGLE	Toggle the relay/light	TOGGLE
+MOTOR ON	Turn ON the motor	MOTOR ON
+MOTOR OFF	Turn OFF the motor	MOTOR OFF
+STATE or STATUS	Query current states of light and motor	STATE or STATUS
+RESTART or RESET	Restart the Arduino microcontroller	RESTART or RESET
+Trusted User Features (Numbers added by Admin):
+Command	Description	Example
+TOGGLE	Toggle the relay/light	TOGGLE
+STATE or STATUS	Query current states of light and motor
